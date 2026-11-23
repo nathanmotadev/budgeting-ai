@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Budgeting · assistente por voz</title>
+  <style>
+    :root {
+      --bg: #f6f4ef; --card: #ffffff; --ink: #1d1b16; --muted: #6b6659;
+      --line: #e4e0d6; --accent: #1f6f50; --accent-soft: #e3f0ea; --danger: #b3261e;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+    main { max-width: 760px; margin: 0 auto; padding: 40px 20px 64px; }
+    h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+    .sub { color: var(--muted); margin: 0 0 28px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+    .mic-row { display: flex; align-items: center; gap: 16px; }
+    #mic { width: 72px; height: 72px; border-radius: 50%; border: none; background: var(--accent); color: #fff; font-size: 1.6rem; cursor: pointer; flex-shrink: 0; transition: transform .1s; }
+    #mic:active { transform: scale(.96); }
+    #mic.recording { background: var(--danger); animation: pulse 1.2s infinite; }
+    @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(179,38,30,.35); } 50% { box-shadow: 0 0 0 12px rgba(179,38,30,0); } }
+    #status { color: var(--muted); }
+    .hint { font-size: .9rem; color: var(--muted); margin-top: 12px; }
+    .bubble { border-radius: 10px; padding: 10px 14px; margin-top: 10px; line-height: 1.45; }
+    .bubble.you { background: #f1efe9; }
+    .bubble.ai { background: var(--accent-soft); }
+    .bubble small { display: block; font-size: .75rem; color: var(--muted); margin-bottom: 2px; text-transform: uppercase; letter-spacing: .04em; }
+    form { display: flex; gap: 8px; margin-top: 14px; }
+    input[type=text] { flex: 1; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 1rem; }
+    button.secondary { padding: 10px 14px; border-radius: 8px; border: 1px solid var(--accent); background: #fff; color: var(--accent); cursor: pointer; font-weight: 600; }
+    h2 { font-size: 1rem; margin: 0 0 12px; display: flex; justify-content: space-between; align-items: baseline; }
+    h2 span { font-weight: 400; color: var(--muted); font-size: .9rem; }
+    .total { font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; }
+    table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+    td { padding: 8px 0; border-top: 1px solid var(--line); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .tag { font-size: .75rem; background: #f1efe9; border-radius: 999px; padding: 2px 8px; color: var(--muted); }
+    .error { color: var(--danger); }
+    .empty { color: var(--muted); font-size: .95rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Assistente financeiro por voz</h1>
+  <p class="sub">Spring Boot + Spring AI · transcrição, tool calling e resposta em áudio</p>
+
+  <section class="card">
+    <div class="mic-row">
+      <button id="mic" aria-label="Gravar comando de voz">🎙</button>
+      <div id="status">Clique no microfone, fale e clique de novo para enviar.</div>
+    </div>
+    <p class="hint">Exemplos: “gastei 80 reais no mercado”, “quanto gastei este mês?”, “apaga o último gasto”.</p>
+    <div id="conversation"></div>
+    <audio id="player" controls hidden style="width:100%;margin-top:12px"></audio>
+    <form id="text-form">
+      <input id="text-input" type="text" placeholder="Ou digite um comando…" autocomplete="off">
+      <button class="secondary" type="submit">Enviar</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Este mês <span id="period"></span></h2>
+    <div class="total" id="total">R$ 0,00</div>
+    <table id="by-category"></table>
+  </section>
+
+  <section class="card">
+    <h2>Últimos gastos</h2>
+    <table id="recent"></table>
+  </section>
+</main>
+
+<script>
+  const brl = v => v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+  const $ = id => document.getElementById(id);
+  let recorder, chunks = [];
+
+  function addBubble(who, text, isError = false) {
+    const div = document.createElement('div');
+    div.className = 'bubble ' + who;
+    div.innerHTML = `<small>${who === 'you' ? 'Você' : 'Assistente'}</small>`;
+    const p = document.createElement('span');
+    p.textContent = text;
+    if (isError) p.className = 'error';
+    div.appendChild(p);
+    $('conversation').appendChild(div);
+  }
+
+  async function problemMessage(res) {
+    try { return (await res.json()).detail || res.statusText; } catch { return res.statusText; }
+  }
+
+  $('mic').addEventListener('click', async () => {
+    if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recorder = new MediaRecorder(stream);
+      chunks = [];
+      recorder.ondataavailable = e => chunks.push(e.data);
+      recorder.onstop = () => { stream.getTracks().forEach(t => t.stop()); sendAudio(); };
+      recorder.start();
+      $('mic').classList.add('recording');
+      $('status').textContent = 'Gravando… clique de novo para enviar.';
+    } catch {
+      $('status').textContent = 'Não consegui acessar o microfone. Verifique a permissão do navegador.';
+    }
+  });
+
+  async function sendAudio() {
+    $('mic').classList.remove('recording');
+    $('status').textContent = 'Processando…';
+    const type = recorder.mimeType || 'audio/webm';
+    const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+    const form = new FormData();
+    form.append('file', new Blob(chunks, { type }), `comando.${ext}`);
+
+    const res = await fetch('/transactions/ai', { method: 'POST', body: form });
+    if (!res.ok) { addBubble('ai', await problemMessage(res), true); $('status').textContent = 'Pronto.'; return; }
+
+    addBubble('you', decodeURIComponent(res.headers.get('X-Transcription') || ''));
+    addBubble('ai', decodeURIComponent(res.headers.get('X-Assistant-Reply') || ''));
+    const player = $('player');
+    player.src = URL.createObjectURL(await res.blob());
+    player.hidden = false;
+    player.play();
+    $('status').textContent = 'Pronto. Pode falar de novo.';
+    refresh();
+  }
+
+  $('text-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const message = $('text-input').value.trim();
+    if (!message) return;
+    $('text-input').value = '';
+    addBubble('you', message);
+    const res = await fetch('/transactions/ai/text', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message })
+    });
+    if (!res.ok) { addBubble('ai', await problemMessage(res), true); return; }
+    addBubble('ai', (await res.json()).reply);
+    refresh();
+  });
+
+  async function refresh() {
+    const [summary, recent] = await Promise.all([
+      fetch('/transactions/summary').then(r => r.json()),
+      fetch('/transactions?limit=8').then(r => r.json())
+    ]);
+
+    $('total').textContent = brl(summary.total);
+    $('period').textContent = `${summary.count} gasto(s)`;
+    $('by-category').innerHTML = summary.byCategory.length
+      ? summary.byCategory.map(c => `<tr><td>${c.categoryLabel}</td><td class="num">${brl(c.total)}</td></tr>`).join('')
+      : '<tr><td class="empty">Nenhum gasto registrado neste mês.</td></tr>';
+
+    $('recent').innerHTML = recent.length
+      ? recent.map(t => `<tr><td>${escapeHtml(t.description)} <span class="tag">${t.categoryLabel}</span></td>
+          <td class="num">${brl(t.amount)}</td></tr>`).join('')
+      : '<tr><td class="empty">Ainda não há gastos.</td></tr>';
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+  }
+
+  refresh();
+</script>
+</body>
+</html>
